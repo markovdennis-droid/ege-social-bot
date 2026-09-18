@@ -6,7 +6,7 @@ from datetime import date, timedelta
 from pathlib import Path
 
 from aiogram import Bot, Dispatcher, F
-from aiogram.filters import CommandStart
+from aiogram.filters import Command, CommandStart
 from aiogram.types import (
     Message,
     CallbackQuery,
@@ -25,6 +25,9 @@ load_dotenv()
 TOKEN = os.getenv("BOT_TOKEN")
 if not TOKEN:
     raise RuntimeError("Не найден BOT_TOKEN. Создай файл .env и вставь туда токен.")
+
+ADMIN_ID_RAW = os.getenv("ADMIN_ID", "").strip()
+ADMIN_ID = int(ADMIN_ID_RAW) if ADMIN_ID_RAW.isdigit() else None
 
 bot = Bot(TOKEN)
 dp = Dispatcher()
@@ -172,6 +175,32 @@ def get_stats(user_id: int):
     return row or (0, 0, 0)
 
 
+def get_admin_stats():
+    conn = db()
+    users = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+    active_today = conn.execute(
+        "SELECT COUNT(*) FROM users WHERE last_day=?",
+        (date.today().isoformat(),),
+    ).fetchone()[0]
+    total, correct = conn.execute(
+        "SELECT COALESCE(SUM(total), 0), COALESCE(SUM(correct), 0) FROM users"
+    ).fetchone()
+    mistakes = conn.execute(
+        "SELECT COALESCE(SUM(wrong_count), 0) FROM mistakes"
+    ).fetchone()[0]
+    conn.close()
+
+    accuracy = round(correct / total * 100) if total else 0
+    return {
+        "users": users,
+        "active_today": active_today,
+        "total": total,
+        "correct": correct,
+        "mistakes": mistakes,
+        "accuracy": accuracy,
+    }
+
+
 def get_mistake_questions(user_id: int, only_active: bool = True):
     conn = db()
 
@@ -248,14 +277,16 @@ def get_mistake_summary(user_id: int):
     }
 
 
-menu = ReplyKeyboardMarkup(
-    keyboard=[
+def main_menu(user_id: int | None = None):
+    rows = [
         [KeyboardButton(text="🎯 5 вопросов"), KeyboardButton(text="🧪 10 вопросов")],
         [KeyboardButton(text="📚 По теме"), KeyboardButton(text="📊 Мой прогресс")],
         [KeyboardButton(text="❌ Мои ошибки"), KeyboardButton(text="🔁 Повтор ошибок")],
-    ],
-    resize_keyboard=True,
-)
+    ]
+    if ADMIN_ID is not None and user_id == ADMIN_ID:
+        rows.append([KeyboardButton(text="📈 Статистика бота")])
+
+    return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
 
 
 def answer_keyboard(question):
@@ -340,7 +371,7 @@ async def send_next(user_id: int, chat_id: int):
             f"✅ Тренировка закончена!\n\n"
             f"Результат: {score}/{total}\n"
             f"Нажми «📊 Мой прогресс», чтобы посмотреть общую статистику.",
-            reply_markup=menu,
+            reply_markup=main_menu(user_id),
         )
         return
 
@@ -383,7 +414,7 @@ async def start(message: Message):
         "• объяснение после ответа помогает сразу закрепить материал.\n\n"
 
         "👇 Выбери режим и начинай тренировку.",
-        reply_markup=menu,
+        reply_markup=main_menu(message.from_user.id),
     )
 
 
@@ -424,7 +455,7 @@ async def mistakes(message: Message):
         await message.answer(
             "У тебя пока нет сохранённых ошибок.\n\n"
             "Неправильные ответы будут автоматически попадать сюда.",
-            reply_markup=menu,
+            reply_markup=main_menu(message.from_user.id),
         )
         return
 
@@ -456,7 +487,10 @@ async def mistakes(message: Message):
             "🎉 Все сохранённые ошибки сейчас отработаны.",
         ])
 
-    await message.answer("\n".join(lines), reply_markup=menu)
+    await message.answer(
+        "\n".join(lines),
+        reply_markup=main_menu(message.from_user.id),
+    )
 
 
 @dp.message(F.text == "🔁 Повтор ошибок")
@@ -471,7 +505,7 @@ async def review_mistakes(message: Message):
         await message.answer(
             "🎉 Сейчас нет ошибок, которые нужно повторить.\n\n"
             "Новые неправильные ответы автоматически появятся в этом разделе.",
-            reply_markup=menu,
+            reply_markup=main_menu(message.from_user.id),
         )
         return
 
@@ -494,7 +528,7 @@ async def review_mistakes(message: Message):
 
 
 @dp.message(F.text == "📊 Мой прогресс")
-async def stats(message: Message):
+async def user_stats(message: Message):
     ensure_user(message.from_user.id)
     total, correct, streak = get_stats(message.from_user.id)
     percent = round(correct / total * 100) if total else 0
@@ -504,8 +538,44 @@ async def stats(message: Message):
         f"Правильно: {correct}\n"
         f"Точность: {percent}%\n"
         f"🔥 Серия дней: {streak}",
-        reply_markup=menu,
+        reply_markup=main_menu(message.from_user.id),
     )
+
+
+async def send_admin_stats(message: Message):
+    if ADMIN_ID is None:
+        await message.answer(
+            "⚠️ ADMIN_ID не настроен. Добавь числовой Telegram ID "
+            "в переменные Railway."
+        )
+        return
+
+    if message.from_user.id != ADMIN_ID:
+        await message.answer("⛔ Эта команда доступна только администратору.")
+        return
+
+    stats = get_admin_stats()
+    await message.answer(
+        "📊 Статистика бота\n\n"
+        f"👥 Пользователей: {stats['users']}\n"
+        f"🟢 Завершили тренировку сегодня: {stats['active_today']}\n"
+        f"📝 Ответов всего: {stats['total']}\n"
+        f"✅ Правильных ответов: {stats['correct']}\n"
+        f"❌ Ошибок: {stats['mistakes']}\n"
+        f"🎯 Общая точность: {stats['accuracy']}%",
+        reply_markup=main_menu(message.from_user.id),
+    )
+
+
+@dp.message(Command("stats"))
+async def admin_stats_command(message: Message):
+    await send_admin_stats(message)
+
+
+@dp.message(F.text == "📊 Статистика")
+@dp.message(F.text == "📈 Статистика бота")
+async def admin_stats_button(message: Message):
+    await send_admin_stats(message)
 
 
 @dp.message(F.text == "📚 По теме")
@@ -592,7 +662,7 @@ async def answer(callback: CallbackQuery):
 async def fallback(message: Message):
     await message.answer(
         "Используй кнопки меню 👇",
-        reply_markup=menu,
+        reply_markup=main_menu(message.from_user.id),
     )
 
 
