@@ -26,6 +26,12 @@ TOKEN = os.getenv("BOT_TOKEN")
 if not TOKEN:
     raise RuntimeError("Не найден BOT_TOKEN. Создай файл .env и вставь туда токен.")
 
+ADMIN_ID_VALUE = os.getenv("ADMIN_ID", "").strip()
+try:
+    ADMIN_ID = int(ADMIN_ID_VALUE) if ADMIN_ID_VALUE else None
+except ValueError:
+    ADMIN_ID = None
+
 bot = Bot(TOKEN)
 dp = Dispatcher()
 
@@ -162,14 +168,20 @@ def record_answer(
     conn.close()
 
 
-def get_stats(user_id: int):
+def get_admin_stats():
     conn = db()
-    row = conn.execute(
-        "SELECT total, correct, streak FROM users WHERE user_id=?",
-        (user_id,),
-    ).fetchone()
+    users, total, correct = conn.execute("""
+        SELECT
+            COUNT(*),
+            COALESCE(SUM(total), 0),
+            COALESCE(SUM(correct), 0)
+        FROM users
+    """).fetchone()
+    wrong = conn.execute(
+        "SELECT COALESCE(SUM(wrong_count), 0) FROM mistakes"
+    ).fetchone()[0]
     conn.close()
-    return row or (0, 0, 0)
+    return users, total, correct, wrong
 
 
 def get_mistake_questions(user_id: int, only_active: bool = True):
@@ -248,14 +260,15 @@ def get_mistake_summary(user_id: int):
     }
 
 
-menu = ReplyKeyboardMarkup(
-    keyboard=[
+def menu_for(user_id: int):
+    keyboard = [
         [KeyboardButton(text="🎯 5 вопросов"), KeyboardButton(text="🧪 10 вопросов")],
-        [KeyboardButton(text="📚 По теме"), KeyboardButton(text="📊 Мой прогресс")],
+        [KeyboardButton(text="📚 По теме")],
         [KeyboardButton(text="❌ Мои ошибки"), KeyboardButton(text="🔁 Повтор ошибок")],
-    ],
-    resize_keyboard=True,
-)
+    ]
+    if ADMIN_ID is not None and user_id == ADMIN_ID:
+        keyboard.append([KeyboardButton(text="📊 Статистика бота")])
+    return ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
 
 
 def answer_keyboard(question):
@@ -338,9 +351,8 @@ async def send_next(user_id: int, chat_id: int):
         await bot.send_message(
             chat_id,
             f"✅ Тренировка закончена!\n\n"
-            f"Результат: {score}/{total}\n"
-            f"Нажми «📊 Мой прогресс», чтобы посмотреть общую статистику.",
-            reply_markup=menu,
+            f"Результат: {score}/{total}",
+            reply_markup=menu_for(user_id),
         )
         return
 
@@ -372,8 +384,7 @@ async def start(message: Message):
         "🧪 10 вопросов — расширенный тест\n"
         "📚 По теме — тренировка по выбранному блоку\n"
         "❌ Мои ошибки — посмотреть свои слабые места\n"
-        "🔁 Повтор ошибок — отдельно отработать только ошибки\n"
-        "📊 Мой прогресс — увидеть статистику, точность и серию дней\n\n"
+        "🔁 Повтор ошибок — отдельно отработать только ошибки\n\n"
 
         "Почему это полезно:\n"
         "• короткие тренировки удобно проходить каждый день;\n"
@@ -383,7 +394,7 @@ async def start(message: Message):
         "• объяснение после ответа помогает сразу закрепить материал.\n\n"
 
         "👇 Выбери режим и начинай тренировку.",
-        reply_markup=menu,
+        reply_markup=menu_for(message.from_user.id),
     )
 
 
@@ -424,7 +435,7 @@ async def mistakes(message: Message):
         await message.answer(
             "У тебя пока нет сохранённых ошибок.\n\n"
             "Неправильные ответы будут автоматически попадать сюда.",
-            reply_markup=menu,
+            reply_markup=menu_for(message.from_user.id),
         )
         return
 
@@ -456,7 +467,10 @@ async def mistakes(message: Message):
             "🎉 Все сохранённые ошибки сейчас отработаны.",
         ])
 
-    await message.answer("\n".join(lines), reply_markup=menu)
+    await message.answer(
+        "\n".join(lines),
+        reply_markup=menu_for(message.from_user.id),
+    )
 
 
 @dp.message(F.text == "🔁 Повтор ошибок")
@@ -471,7 +485,7 @@ async def review_mistakes(message: Message):
         await message.answer(
             "🎉 Сейчас нет ошибок, которые нужно повторить.\n\n"
             "Новые неправильные ответы автоматически появятся в этом разделе.",
-            reply_markup=menu,
+            reply_markup=menu_for(message.from_user.id),
         )
         return
 
@@ -494,18 +508,32 @@ async def review_mistakes(message: Message):
 
 
 @dp.message(Command("stats"))
-@dp.message(F.text == "📊 Мой прогресс")
-async def stats(message: Message):
-    ensure_user(message.from_user.id)
-    total, correct, streak = get_stats(message.from_user.id)
+@dp.message(F.text == "📊 Статистика бота")
+async def admin_stats(message: Message):
+    if ADMIN_ID is None:
+        await message.answer(
+            "⚙️ ADMIN_ID пока не настроен.\n\n"
+            f"Твой Telegram ID: {message.from_user.id}\n\n"
+            "Добавь в Railway → Variables:\n"
+            f"ADMIN_ID={message.from_user.id}\n\n"
+            "Затем перезапусти deployment."
+        )
+        return
+
+    if message.from_user.id != ADMIN_ID:
+        await message.answer("⛔ Эта команда доступна только администратору.")
+        return
+
+    users, total, correct, wrong = get_admin_stats()
     percent = round(correct / total * 100) if total else 0
     await message.answer(
-        f"📊 Твой прогресс\n\n"
-        f"Решено: {total}\n"
-        f"Правильно: {correct}\n"
-        f"Точность: {percent}%\n"
-        f"🔥 Серия дней: {streak}",
-        reply_markup=menu,
+        "📊 Статистика бота\n\n"
+        f"Пользователей: {users}\n"
+        f"Всего ответов: {total}\n"
+        f"Правильных ответов: {correct}\n"
+        f"Неправильных ответов: {wrong}\n"
+        f"Общая точность: {percent}%",
+        reply_markup=menu_for(message.from_user.id),
     )
 
 
@@ -593,7 +621,7 @@ async def answer(callback: CallbackQuery):
 async def fallback(message: Message):
     await message.answer(
         "Используй кнопки меню 👇",
-        reply_markup=menu,
+        reply_markup=menu_for(message.from_user.id),
     )
 
 
