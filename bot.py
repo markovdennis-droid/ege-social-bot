@@ -6,7 +6,7 @@ from datetime import date, timedelta
 from pathlib import Path
 
 from aiogram import Bot, Dispatcher, F
-from aiogram.filters import CommandStart
+from aiogram.filters import Command, CommandStart
 from aiogram.types import (
     Message,
     CallbackQuery,
@@ -493,6 +493,7 @@ async def review_mistakes(message: Message):
     await send_next(message.from_user.id, message.chat.id)
 
 
+@dp.message(Command("stats"))
 @dp.message(F.text == "📊 Мой прогресс")
 async def stats(message: Message):
     ensure_user(message.from_user.id)
