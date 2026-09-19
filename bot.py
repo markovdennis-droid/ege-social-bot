@@ -3,7 +3,6 @@ import os
 import random
 import sqlite3
 from datetime import date, timedelta
-from pathlib import Path
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, CommandStart
@@ -14,7 +13,6 @@ from aiogram.types import (
     InlineKeyboardButton,
     ReplyKeyboardMarkup,
     KeyboardButton,
-    FSInputFile,
 )
 from dotenv import load_dotenv
 
@@ -35,8 +33,7 @@ dp = Dispatcher()
 DB_PATH = "progress.db"
 ACTIVE = {}
 
-AD_IMAGE = Path(__file__).resolve().parent / "assets" / "ad.jpg"
-AD_URL = "https://www.egetraining.com/"
+AD_URL = "https://vk.ru/allateach"
 AD_EVERY = 5
 
 
@@ -335,23 +332,23 @@ def question_text(question, number=None, total=None):
 
 
 async def send_ad(chat_id: int):
-    """Показывает рекламный блок с картинкой и кнопкой."""
+    """Приглашает подписаться на страницу ВКонтакте."""
     keyboard = InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="🚀 Перейти на egetraining.com", url=AD_URL)]
+            [InlineKeyboardButton(
+                text="👉 Перейти во ВКонтакте",
+                url=AD_URL,
+            )]
         ]
     )
-    await bot.send_photo(
+    await bot.send_message(
         chat_id=chat_id,
-        photo=FSInputFile(AD_IMAGE),
-        caption=(
-            "📚 Тренажёр ЕГЭ по обществознанию\n"
-            "1000+ авторских заданий для подготовки.\n\n"
-            "👇 Подробнее на сайте"
+        text=(
+            "📚 Подписывайся на мою страницу ВКонтакте!\n\n"
+            f"{AD_URL}"
         ),
         reply_markup=keyboard,
     )
-
 
 async def send_next(user_id: int, chat_id: int):
     session = ACTIVE.get(user_id)
