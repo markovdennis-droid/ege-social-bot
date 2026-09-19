@@ -3,6 +3,7 @@ import os
 import random
 import sqlite3
 from datetime import date, timedelta
+from pathlib import Path
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, CommandStart
@@ -13,6 +14,7 @@ from aiogram.types import (
     InlineKeyboardButton,
     ReplyKeyboardMarkup,
     KeyboardButton,
+    FSInputFile,
 )
 from dotenv import load_dotenv
 
@@ -33,6 +35,7 @@ dp = Dispatcher()
 DB_PATH = "progress.db"
 ACTIVE = {}
 
+AD_IMAGE = Path(__file__).resolve().parent / "assets" / "ad.jpg"
 AD_URL = "https://vk.ru/allateach"
 AD_EVERY = 5
 
@@ -332,7 +335,7 @@ def question_text(question, number=None, total=None):
 
 
 async def send_ad(chat_id: int):
-    """Приглашает подписаться на страницу ВКонтакте."""
+    """Показывает фото с приглашением подписаться на страницу ВКонтакте."""
     keyboard = InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(
@@ -341,14 +344,16 @@ async def send_ad(chat_id: int):
             )]
         ]
     )
-    await bot.send_message(
+    await bot.send_photo(
         chat_id=chat_id,
-        text=(
-            "📚 Подписывайся на мою страницу ВКонтакте!\n\n"
+        photo=FSInputFile(AD_IMAGE),
+        caption=(
+            "📚 Подписывайтесь на страницу ВКонтакте и следите за новостями!\n\n"
             f"{AD_URL}"
         ),
         reply_markup=keyboard,
     )
+
 
 async def send_next(user_id: int, chat_id: int):
     session = ACTIVE.get(user_id)
