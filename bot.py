@@ -20,7 +20,6 @@ from aiogram.types import (
     KeyboardButton,
     FSInputFile,
     BotCommand,
-    BotCommand,
 )
 from dotenv import load_dotenv
 
@@ -42,8 +41,31 @@ if not DATABASE_URL:
 bot = Bot(TOKEN)
 dp = Dispatcher()
 
-AD_IMAGE = Path(__file__).resolve().parent / "assets" / "ad.jpg"
-AD_URL = "https://vk.ru/allateach"
+ASSETS = Path(__file__).resolve().parent / "assets"
+
+# Рекламные блоки чередуются у каждого ученика: VK → канал → VK → канал …
+# Ссылка на канал берётся из переменной Railway CHANNEL_URL (например https://t.me/имя_канала).
+# Пока она не задана, показывается только реклама VK.
+CHANNEL_URL = os.getenv("CHANNEL_URL", "").strip()
+ADS = [
+    {
+        "image": ASSETS / "ad.jpg",
+        "url": "https://vk.ru/allateach",
+        "button": "👉 Перейти во ВКонтакте",
+        "caption": "📚 Подписывайтесь на страницу ВКонтакте и следите за новостями!",
+    },
+]
+if CHANNEL_URL:
+    ADS.append({
+        "image": ASSETS / "channel.jpg",
+        "url": CHANNEL_URL,
+        "button": "👉 Подписаться на канал",
+        "caption": (
+            "📢 Обществознание простыми словами: новости ЕГЭ, полезные советы, "
+            "юмор и интересные рубрики.\n\n"
+            "Всё самое важное и полезное — в одном канале!"
+        ),
+    })
 # Реклама показывается один раз за тренировку (и в 5, и в 10 вопросов):
 # между 3-м и 4-м вопросом, то есть перед вопросом №4.
 # Если в тренировке меньше 4 вопросов (бывает в «Повторе ошибок»), рекламы нет.
@@ -269,7 +291,7 @@ def init_db():
         """)
         conn.execute("ALTER TABLE ege_bot.users ADD COLUMN IF NOT EXISTS trainings_done BIGINT DEFAULT 0")
         conn.execute("ALTER TABLE ege_bot.users ADD COLUMN IF NOT EXISTS help_msg_id BIGINT")
-        conn.execute("ALTER TABLE ege_bot.users ADD COLUMN IF NOT EXISTS help_msg_id BIGINT")
+        conn.execute("ALTER TABLE ege_bot.users ADD COLUMN IF NOT EXISTS ads_shown BIGINT DEFAULT 0")
         conn.execute("ALTER TABLE ege_bot.users ADD COLUMN IF NOT EXISTS ege_tasks BIGINT DEFAULT 0")
         conn.execute("ALTER TABLE ege_bot.users ADD COLUMN IF NOT EXISTS ege_points BIGINT DEFAULT 0")
         conn.execute("""
@@ -505,15 +527,16 @@ def apply_ege_answer(user_id: int, session_id: int, task_idx: int, chosen: int):
         }
 
 
-def get_help_msg_id(user_id: int):
+def next_ad_index(user_id: int) -> int:
+    """Номер следующего рекламного блока для ученика (по кругу) и +1 к счётчику показов."""
     with db() as conn:
-        row = conn.execute("SELECT help_msg_id FROM ege_bot.users WHERE user_id=%s", (user_id,)).fetchone()
-        return row[0] if row else None
-
-
-def set_help_msg_id(user_id: int, msg_id: int):
-    with db() as conn:
-        conn.execute("UPDATE ege_bot.users SET help_msg_id=%s WHERE user_id=%s", (msg_id, user_id))
+        row = conn.execute(
+            "UPDATE ege_bot.users SET ads_shown=COALESCE(ads_shown, 0)+1 "
+            "WHERE user_id=%s RETURNING ads_shown",
+            (user_id,),
+        ).fetchone()
+    shown = row[0] if row else 1
+    return (shown - 1) % len(ADS)
 
 
 def get_help_msg_id(user_id: int):
@@ -670,14 +693,15 @@ def question_text(question, number: int, total: int):
     return f"{head}\n\n{options_text}\n\n👇 Выбери букву ответа:"
 
 
-async def send_ad(chat_id: int):
+async def send_ad(chat_id: int, user_id: int):
+    ad = ADS[await asyncio.to_thread(next_ad_index, user_id)]
     keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[[InlineKeyboardButton(text="👉 Перейти во ВКонтакте", url=AD_URL)]]
+        inline_keyboard=[[InlineKeyboardButton(text=ad["button"], url=ad["url"])]]
     )
     await bot.send_photo(
         chat_id=chat_id,
-        photo=FSInputFile(AD_IMAGE),
-        caption="📚 Подписывайтесь на страницу ВКонтакте и следите за новостями!",
+        photo=FSInputFile(ad["image"]),
+        caption=ad["caption"],
         reply_markup=keyboard,
     )
 
@@ -901,7 +925,7 @@ async def answer(callback: CallbackQuery):
         next_number = res["idx"] + 1
         if next_number == AD_BEFORE_QUESTION:
             try:
-                await send_ad(chat_id)
+                await send_ad(chat_id, user_id)
             except TelegramAPIError:
                 pass  # сбой рекламы не должен ломать тренировку
         await send_question(chat_id, QMAP[res["next_qid"]], session_id, next_number, res["total"])
@@ -1043,7 +1067,7 @@ async def ege_done(callback: CallbackQuery):
         next_number = res["idx"] + 1
         if next_number == AD_BEFORE_QUESTION:
             try:
-                await send_ad(chat_id)
+                await send_ad(chat_id, user_id)
             except TelegramAPIError:
                 pass
         await bot.send_message(
@@ -1245,10 +1269,6 @@ async def main():
     await asyncio.to_thread(init_db)
     try:
         await configure_bot_description(bot)
-        await bot.set_my_commands([
-            BotCommand(command="start", description="Начать и открыть меню"),
-            BotCommand(command="help", description="Как пользоваться ботом"),
-        ])
         await bot.set_my_commands([
             BotCommand(command="start", description="Начать и открыть меню"),
             BotCommand(command="help", description="Как пользоваться ботом"),
