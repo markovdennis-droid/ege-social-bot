@@ -1,11 +1,12 @@
 import asyncio
 import os
 import random
-import sqlite3
+import psycopg
 from datetime import date, timedelta
 from pathlib import Path
 
 from aiogram import Bot, Dispatcher, F
+from aiogram.exceptions import TelegramAPIError
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
     Message,
@@ -32,249 +33,122 @@ ADMIN_ID = int(ADMIN_ID_RAW) if ADMIN_ID_RAW.isdigit() else None
 bot = Bot(TOKEN)
 dp = Dispatcher()
 
-DB_PATH = "progress.db"
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+if not DATABASE_URL:
+    raise RuntimeError("Не задан DATABASE_URL для PostgreSQL. Добавь его в Railway.")
 ACTIVE = {}
 
 AD_IMAGE = Path(__file__).resolve().parent / "assets" / "ad.jpg"
 AD_URL = "https://vk.ru/allateach"
 AD_EVERY = 5
 
+BOT_DESCRIPTION = (
+    '👋 Привет! Я бот-тренажёр для подготовки к ЕГЭ по обществознанию.\n'
+    '\n'
+    '📚 1100 авторских вопросов по темам: человек и общество, экономика, социальные отношения, политика и право.\n'
+    '\n'
+    'Я помогу тебе:\n'
+    '🎯 Тренироваться по 5 или 10 вопросов.\n'
+    '📖 Разбирать правильные ответы и объяснения.\n'
+    '🔁 Повторять вопросы, в которых были ошибки.\n'
+    '📊 Следить за результатами и серией дней занятий.\n'
+    '\n'
+    'Нажми «Запустить» — и начнём!'
+)
+
+BOT_SHORT_DESCRIPTION = 'Подготовка к ЕГЭ по обществознанию: 1100 вопросов, объяснения, повтор ошибок и статистика.'
+
 
 def db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY,
-            total INTEGER DEFAULT 0,
-            correct INTEGER DEFAULT 0,
-            streak INTEGER DEFAULT 0,
-            last_day TEXT
-        )
-    """)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS mistakes (
-            user_id INTEGER,
-            question_id INTEGER,
-            wrong_count INTEGER DEFAULT 1,
-            needs_review INTEGER DEFAULT 1,
-            last_wrong_option INTEGER,
-            last_wrong_at TEXT,
-            reviewed_correctly INTEGER DEFAULT 0,
-            PRIMARY KEY (user_id, question_id)
-        )
-    """)
+    """Новое подключение; вызывающий код закрывает его через with."""
+    return psycopg.connect(
+        DATABASE_URL,
+        connect_timeout=10,
+        options="-c statement_timeout=15000",
+    )
 
-    # Автоматически обновляем старую progress.db, если она уже существует.
-    columns = {
-        row[1] for row in conn.execute("PRAGMA table_info(mistakes)").fetchall()
-    }
-    if "needs_review" not in columns:
-        conn.execute(
-            "ALTER TABLE mistakes ADD COLUMN needs_review INTEGER DEFAULT 1"
-        )
-    if "last_wrong_option" not in columns:
-        conn.execute(
-            "ALTER TABLE mistakes ADD COLUMN last_wrong_option INTEGER"
-        )
-    if "last_wrong_at" not in columns:
-        conn.execute(
-            "ALTER TABLE mistakes ADD COLUMN last_wrong_at TEXT"
-        )
-    if "reviewed_correctly" not in columns:
-        conn.execute(
-            "ALTER TABLE mistakes ADD COLUMN reviewed_correctly INTEGER DEFAULT 0"
-        )
 
-    conn.commit()
-    return conn
+def init_db():
+    """Создаёт таблицы один раз при запуске, не очищая статистику."""
+    with db() as conn:
+        conn.execute('CREATE SCHEMA IF NOT EXISTS ege_bot;\nCREATE TABLE IF NOT EXISTS ege_bot.users (\n    user_id BIGINT PRIMARY KEY,\n    total BIGINT DEFAULT 0,\n    correct BIGINT DEFAULT 0,\n    streak INTEGER DEFAULT 0,\n    last_day TEXT\n);\nCREATE TABLE IF NOT EXISTS ege_bot.mistakes (\n    user_id BIGINT,\n    question_id INTEGER,\n    wrong_count BIGINT DEFAULT 1,\n    needs_review INTEGER DEFAULT 1,\n    last_wrong_option INTEGER,\n    last_wrong_at TEXT,\n    reviewed_correctly BIGINT DEFAULT 0,\n    PRIMARY KEY (user_id, question_id)\n);')
 
 
 def ensure_user(user_id: int):
-    conn = db()
-    conn.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (user_id,))
-    conn.commit()
-    conn.close()
+    with db() as conn:
+        conn.execute('INSERT INTO ege_bot.users (user_id) VALUES (%s) ON CONFLICT (user_id) DO NOTHING', (user_id,))
 
 
 def update_streak(user_id: int):
     today = date.today()
-    conn = db()
-    row = conn.execute("SELECT streak, last_day FROM users WHERE user_id=?", (user_id,)).fetchone()
-    streak, last_day = row if row else (0, None)
-
-    if last_day == today.isoformat():
-        conn.close()
-        return
-
-    if last_day == (today - timedelta(days=1)).isoformat():
-        streak += 1
-    else:
-        streak = 1
-
-    conn.execute(
-        "UPDATE users SET streak=?, last_day=? WHERE user_id=?",
-        (streak, today.isoformat(), user_id),
-    )
-    conn.commit()
-    conn.close()
+    with db() as conn:
+        row = conn.execute('SELECT streak, last_day FROM ege_bot.users WHERE user_id=%s FOR UPDATE', (user_id,)).fetchone()
+        streak, last_day = row if row else (0, None)
+        if last_day == today.isoformat():
+            return
+        if last_day == (today - timedelta(days=1)).isoformat():
+            streak += 1
+        else:
+            streak = 1
+        conn.execute('UPDATE ege_bot.users SET streak=%s, last_day=%s WHERE user_id=%s', (streak, today.isoformat(), user_id))
 
 
-def record_answer(
-    user_id: int,
-    question_id: int,
-    is_correct: bool,
-    chosen_option: int | None = None,
-    review_mode: bool = False,
-):
-    conn = db()
-    conn.execute("UPDATE users SET total=total+1 WHERE user_id=?", (user_id,))
-
-    if is_correct:
-        conn.execute("UPDATE users SET correct=correct+1 WHERE user_id=?", (user_id,))
-
-        # Ошибка считается отработанной только в отдельном режиме повтора.
-        # Историю не удаляем.
-        if review_mode:
-            conn.execute("""
-                UPDATE mistakes
-                SET needs_review=0,
-                    reviewed_correctly=reviewed_correctly+1
-                WHERE user_id=? AND question_id=?
-            """, (user_id, question_id))
-    else:
-        conn.execute("""
-            INSERT INTO mistakes(
-                user_id,
-                question_id,
-                wrong_count,
-                needs_review,
-                last_wrong_option,
-                last_wrong_at,
-                reviewed_correctly
-            )
-            VALUES (?, ?, 1, 1, ?, datetime('now'), 0)
-            ON CONFLICT(user_id, question_id)
-            DO UPDATE SET
-                wrong_count=wrong_count+1,
-                needs_review=1,
-                last_wrong_option=excluded.last_wrong_option,
-                last_wrong_at=datetime('now')
-        """, (user_id, question_id, chosen_option))
-
-    conn.commit()
-    conn.close()
+def record_answer(user_id: int, question_id: int, is_correct: bool, chosen_option: int | None=None, review_mode: bool=False):
+    with db() as conn:
+        conn.execute('UPDATE ege_bot.users SET total=total+1 WHERE user_id=%s', (user_id,))
+        if is_correct:
+            conn.execute('UPDATE ege_bot.users SET correct=correct+1 WHERE user_id=%s', (user_id,))
+            if review_mode:
+                conn.execute('\n                UPDATE ege_bot.mistakes\n                SET needs_review=0,\n                    reviewed_correctly=reviewed_correctly+1\n                WHERE user_id=%s AND question_id=%s\n            ', (user_id, question_id))
+        else:
+            conn.execute("\n            INSERT INTO ege_bot.mistakes(\n                user_id,\n                question_id,\n                wrong_count,\n                needs_review,\n                last_wrong_option,\n                last_wrong_at,\n                reviewed_correctly\n            )\n            VALUES (%s, %s, 1, 1, %s, to_char(CURRENT_TIMESTAMP AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS'), 0)\n            ON CONFLICT(user_id, question_id)\n            DO UPDATE SET\n                wrong_count=mistakes.wrong_count+1,\n                needs_review=1,\n                last_wrong_option=excluded.last_wrong_option,\n                last_wrong_at=to_char(CURRENT_TIMESTAMP AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS')\n        ", (user_id, question_id, chosen_option))
 
 
 def get_stats(user_id: int):
-    conn = db()
-    row = conn.execute(
-        "SELECT total, correct, streak FROM users WHERE user_id=?",
-        (user_id,),
-    ).fetchone()
-    conn.close()
-    return row or (0, 0, 0)
+    with db() as conn:
+        row = conn.execute('SELECT total, correct, streak FROM ege_bot.users WHERE user_id=%s', (user_id,)).fetchone()
+        return row or (0, 0, 0)
 
 
 def get_admin_stats():
-    conn = db()
-    users = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
-    active_today = conn.execute(
-        "SELECT COUNT(*) FROM users WHERE last_day=?",
-        (date.today().isoformat(),),
-    ).fetchone()[0]
-    total, correct = conn.execute(
-        "SELECT COALESCE(SUM(total), 0), COALESCE(SUM(correct), 0) FROM users"
-    ).fetchone()
-    mistakes = conn.execute(
-        "SELECT COALESCE(SUM(wrong_count), 0) FROM mistakes"
-    ).fetchone()[0]
-    conn.close()
-
-    accuracy = round(correct / total * 100) if total else 0
-    return {
-        "users": users,
-        "active_today": active_today,
-        "total": total,
-        "correct": correct,
-        "mistakes": mistakes,
-        "accuracy": accuracy,
-    }
+    with db() as conn:
+        users = conn.execute('SELECT COUNT(*) FROM ege_bot.users').fetchone()[0]
+        active_today = conn.execute('SELECT COUNT(*) FROM ege_bot.users WHERE last_day=%s', (date.today().isoformat(),)).fetchone()[0]
+        total, correct = conn.execute('SELECT COALESCE(SUM(total), 0), COALESCE(SUM(correct), 0) FROM ege_bot.users').fetchone()
+        mistakes = conn.execute('SELECT COALESCE(SUM(wrong_count), 0) FROM ege_bot.mistakes').fetchone()[0]
+        accuracy = round(correct / total * 100) if total else 0
+        return {'users': users, 'active_today': active_today, 'total': total, 'correct': correct, 'mistakes': mistakes, 'accuracy': accuracy}
 
 
-def get_mistake_questions(user_id: int, only_active: bool = True):
-    conn = db()
-
-    if only_active:
-        rows = conn.execute("""
-            SELECT question_id
-            FROM mistakes
-            WHERE user_id=? AND needs_review=1
-            ORDER BY wrong_count DESC, last_wrong_at DESC
-        """, (user_id,)).fetchall()
-    else:
-        rows = conn.execute("""
-            SELECT question_id
-            FROM mistakes
-            WHERE user_id=?
-            ORDER BY needs_review DESC, wrong_count DESC, last_wrong_at DESC
-        """, (user_id,)).fetchall()
-
-    conn.close()
-    mapping = {q["id"]: q for q in QUESTIONS}
-    return [mapping[row[0]] for row in rows if row[0] in mapping]
+def get_mistake_questions(user_id: int, only_active: bool=True):
+    with db() as conn:
+        if only_active:
+            rows = conn.execute('\n            SELECT question_id\n            FROM ege_bot.mistakes\n            WHERE user_id=%s AND needs_review=1\n            ORDER BY wrong_count DESC, last_wrong_at DESC\n        ', (user_id,)).fetchall()
+        else:
+            rows = conn.execute('\n            SELECT question_id\n            FROM ege_bot.mistakes\n            WHERE user_id=%s\n            ORDER BY needs_review DESC, wrong_count DESC, last_wrong_at DESC\n        ', (user_id,)).fetchall()
+        mapping = {q['id']: q for q in QUESTIONS}
+        return [mapping[row[0]] for row in rows if row[0] in mapping]
 
 
 def get_mistake_summary(user_id: int):
-    conn = db()
-
-    total_unique = conn.execute(
-        "SELECT COUNT(*) FROM mistakes WHERE user_id=?",
-        (user_id,),
-    ).fetchone()[0]
-
-    active_unique = conn.execute(
-        "SELECT COUNT(*) FROM mistakes WHERE user_id=? AND needs_review=1",
-        (user_id,),
-    ).fetchone()[0]
-
-    total_wrong = conn.execute(
-        "SELECT COALESCE(SUM(wrong_count), 0) FROM mistakes WHERE user_id=?",
-        (user_id,),
-    ).fetchone()[0]
-
-    rows = conn.execute("""
-        SELECT question_id, wrong_count, needs_review
-        FROM mistakes
-        WHERE user_id=?
-        ORDER BY needs_review DESC, wrong_count DESC, last_wrong_at DESC
-    """, (user_id,)).fetchall()
-
-    conn.close()
-
-    mapping = {q["id"]: q for q in QUESTIONS}
-    by_topic = {}
-
-    for question_id, wrong_count, needs_review in rows:
-        question = mapping.get(question_id)
-        if not question:
-            continue
-
-        topic = question["topic"]
-        data = by_topic.setdefault(
-            topic,
-            {"active": 0, "questions": 0, "wrong_answers": 0},
-        )
-        data["questions"] += 1
-        data["wrong_answers"] += wrong_count
-        if needs_review:
-            data["active"] += 1
-
-    return {
-        "total_unique": total_unique,
-        "active_unique": active_unique,
-        "total_wrong": total_wrong,
-        "by_topic": by_topic,
-    }
+    with db() as conn:
+        total_unique = conn.execute('SELECT COUNT(*) FROM ege_bot.mistakes WHERE user_id=%s', (user_id,)).fetchone()[0]
+        active_unique = conn.execute('SELECT COUNT(*) FROM ege_bot.mistakes WHERE user_id=%s AND needs_review=1', (user_id,)).fetchone()[0]
+        total_wrong = conn.execute('SELECT COALESCE(SUM(wrong_count), 0) FROM ege_bot.mistakes WHERE user_id=%s', (user_id,)).fetchone()[0]
+        rows = conn.execute('\n        SELECT question_id, wrong_count, needs_review\n        FROM ege_bot.mistakes\n        WHERE user_id=%s\n        ORDER BY needs_review DESC, wrong_count DESC, last_wrong_at DESC\n    ', (user_id,)).fetchall()
+        mapping = {q['id']: q for q in QUESTIONS}
+        by_topic = {}
+        for question_id, wrong_count, needs_review in rows:
+            question = mapping.get(question_id)
+            if not question:
+                continue
+            topic = question['topic']
+            data = by_topic.setdefault(topic, {'active': 0, 'questions': 0, 'wrong_answers': 0})
+            data['questions'] += 1
+            data['wrong_answers'] += wrong_count
+            if needs_review:
+                data['active'] += 1
+        return {'total_unique': total_unique, 'active_unique': active_unique, 'total_wrong': total_wrong, 'by_topic': by_topic}
 
 
 def main_menu(user_id: int | None = None):
@@ -367,7 +241,7 @@ async def send_next(user_id: int, chat_id: int):
         score = session["score"]
         total = len(questions)
         ACTIVE.pop(user_id, None)
-        update_streak(user_id)
+        await asyncio.to_thread(update_streak, user_id)
         await bot.send_message(
             chat_id,
             f"✅ Тренировка закончена!\n\n"
@@ -394,7 +268,7 @@ async def send_next(user_id: int, chat_id: int):
 
 @dp.message(CommandStart())
 async def start(message: Message):
-    ensure_user(message.from_user.id)
+    await asyncio.to_thread(ensure_user, message.from_user.id)
     await message.answer(
         "👋 Привет! Я тренажёр ЕГЭ по обществознанию.\n\n"
         "📚 В базе 1100 авторских тренировочных вопросов "
@@ -422,7 +296,7 @@ async def start(message: Message):
 
 @dp.message(F.text == "🎯 5 вопросов")
 async def training(message: Message):
-    ensure_user(message.from_user.id)
+    await asyncio.to_thread(ensure_user, message.from_user.id)
     selected = random.sample(QUESTIONS, min(5, len(QUESTIONS)))
     ACTIVE[message.from_user.id] = {
         "questions": selected,
@@ -437,7 +311,7 @@ async def training(message: Message):
 
 @dp.message(F.text == "🧪 10 вопросов")
 async def ten_questions(message: Message):
-    ensure_user(message.from_user.id)
+    await asyncio.to_thread(ensure_user, message.from_user.id)
     selected = random.sample(QUESTIONS, min(10, len(QUESTIONS)))
     ACTIVE[message.from_user.id] = {
         "questions": selected,
@@ -450,8 +324,8 @@ async def ten_questions(message: Message):
 
 @dp.message(F.text == "❌ Мои ошибки")
 async def mistakes(message: Message):
-    ensure_user(message.from_user.id)
-    summary = get_mistake_summary(message.from_user.id)
+    await asyncio.to_thread(ensure_user, message.from_user.id)
+    summary = await asyncio.to_thread(get_mistake_summary, message.from_user.id)
 
     if summary["total_unique"] == 0:
         await message.answer(
@@ -497,11 +371,8 @@ async def mistakes(message: Message):
 
 @dp.message(F.text == "🔁 Повтор ошибок")
 async def review_mistakes(message: Message):
-    ensure_user(message.from_user.id)
-    questions = get_mistake_questions(
-        message.from_user.id,
-        only_active=True,
-    )
+    await asyncio.to_thread(ensure_user, message.from_user.id)
+    questions = await asyncio.to_thread(get_mistake_questions, message.from_user.id, only_active=True)
 
     if not questions:
         await message.answer(
@@ -531,8 +402,8 @@ async def review_mistakes(message: Message):
 
 @dp.message(F.text == "📊 Мой прогресс")
 async def user_stats(message: Message):
-    ensure_user(message.from_user.id)
-    total, correct, streak = get_stats(message.from_user.id)
+    await asyncio.to_thread(ensure_user, message.from_user.id)
+    total, correct, streak = await asyncio.to_thread(get_stats, message.from_user.id)
     percent = round(correct / total * 100) if total else 0
     await message.answer(
         f"📊 Твой прогресс\n\n"
@@ -556,7 +427,7 @@ async def send_admin_stats(message: Message):
         await message.answer("⛔ Эта команда доступна только администратору.")
         return
 
-    stats = get_admin_stats()
+    stats = await asyncio.to_thread(get_admin_stats)
     await message.answer(
         "📊 Статистика бота\n\n"
         f"👥 Пользователей: {stats['users']}\n"
@@ -629,13 +500,7 @@ async def answer(callback: CallbackQuery):
         return
 
     is_correct = chosen == q["correct"]
-    record_answer(
-        user_id,
-        q["id"],
-        is_correct,
-        chosen_option=chosen,
-        review_mode=session.get("review_mode", False),
-    )
+    await asyncio.to_thread(record_answer, user_id, q['id'], is_correct, chosen_option=chosen, review_mode=session.get('review_mode', False))
 
     if is_correct:
         session["score"] += 1
@@ -668,8 +533,33 @@ async def fallback(message: Message):
     )
 
 
+async def configure_bot_description(client: Bot):
+    """Описание для пустого чата до /start и краткий текст профиля."""
+    # Обновляем общий вариант и русский: локализованный текст имеет приоритет.
+    for language in ("", "ru"):
+        await client.set_my_description(
+            description=BOT_DESCRIPTION,
+            language_code=language,
+        )
+        await client.set_my_short_description(
+            short_description=BOT_SHORT_DESCRIPTION,
+            language_code=language,
+        )
+
+
 async def main():
-    print("Бот запущен.")
+    await asyncio.to_thread(init_db)
+    try:
+        await configure_bot_description(bot)
+        print("Описание бота в Telegram обновлено.", flush=True)
+    except TelegramAPIError as error:
+        # Сбой настройки профиля не должен останавливать тренировки.
+        print(
+            f"Не удалось обновить описание Telegram ({type(error).__name__}). "
+            "Повторите настройку позже или через BotFather.",
+            flush=True,
+        )
+    print("Бот запущен. Статистика хранится в PostgreSQL.", flush=True)
     await dp.start_polling(bot)
 
 
