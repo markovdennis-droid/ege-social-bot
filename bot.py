@@ -4,7 +4,6 @@ import os
 import random
 import time
 from datetime import date, timedelta
-from pathlib import Path
 
 import psycopg
 from psycopg.types.json import Jsonb
@@ -18,7 +17,6 @@ from aiogram.types import (
     InlineKeyboardButton,
     ReplyKeyboardMarkup,
     KeyboardButton,
-    FSInputFile,
     BotCommand,
 )
 from dotenv import load_dotenv
@@ -40,36 +38,6 @@ if not DATABASE_URL:
 
 bot = Bot(TOKEN)
 dp = Dispatcher()
-
-ASSETS = Path(__file__).resolve().parent / "assets"
-
-# Рекламные блоки чередуются у каждого ученика: VK → канал → VK → канал …
-# Ссылка на канал берётся из переменной Railway CHANNEL_URL (например https://t.me/имя_канала).
-# Пока она не задана, показывается только реклама VK.
-CHANNEL_URL = os.getenv("CHANNEL_URL", "").strip()
-ADS = [
-    {
-        "image": ASSETS / "ad.jpg",
-        "url": "https://vk.ru/allateach",
-        "button": "👉 Перейти во ВКонтакте",
-        "caption": "📚 Подписывайтесь на страницу ВКонтакте и следите за новостями!",
-    },
-]
-if CHANNEL_URL:
-    ADS.append({
-        "image": ASSETS / "channel.jpg",
-        "url": CHANNEL_URL,
-        "button": "👉 Подписаться на канал",
-        "caption": (
-            "📢 Обществознание простыми словами: новости ЕГЭ, полезные советы, "
-            "юмор и интересные рубрики.\n\n"
-            "Всё самое важное и полезное — в одном канале!"
-        ),
-    })
-# Реклама показывается один раз за тренировку (и в 5, и в 10 вопросов):
-# между 3-м и 4-м вопросом, то есть перед вопросом №4.
-# Если в тренировке меньше 4 вопросов (бывает в «Повторе ошибок»), рекламы нет.
-AD_BEFORE_QUESTION = 4
 
 FEEDBACK_TIMEOUT = 600      # сколько секунд бот ждёт текст пожелания после нажатия кнопки
 FEEDBACK_COOLDOWN = 30      # минимальный интервал между пожеланиями одного ученика
@@ -291,7 +259,6 @@ def init_db():
         """)
         conn.execute("ALTER TABLE ege_bot.users ADD COLUMN IF NOT EXISTS trainings_done BIGINT DEFAULT 0")
         conn.execute("ALTER TABLE ege_bot.users ADD COLUMN IF NOT EXISTS help_msg_id BIGINT")
-        conn.execute("ALTER TABLE ege_bot.users ADD COLUMN IF NOT EXISTS ads_shown BIGINT DEFAULT 0")
         conn.execute("ALTER TABLE ege_bot.users ADD COLUMN IF NOT EXISTS ege_tasks BIGINT DEFAULT 0")
         conn.execute("ALTER TABLE ege_bot.users ADD COLUMN IF NOT EXISTS ege_points BIGINT DEFAULT 0")
         conn.execute("""
@@ -527,18 +494,6 @@ def apply_ege_answer(user_id: int, session_id: int, task_idx: int, chosen: int):
         }
 
 
-def next_ad_index(user_id: int) -> int:
-    """Номер следующего рекламного блока для ученика (по кругу) и +1 к счётчику показов."""
-    with db() as conn:
-        row = conn.execute(
-            "UPDATE ege_bot.users SET ads_shown=COALESCE(ads_shown, 0)+1 "
-            "WHERE user_id=%s RETURNING ads_shown",
-            (user_id,),
-        ).fetchone()
-    shown = row[0] if row else 1
-    return (shown - 1) % len(ADS)
-
-
 def get_help_msg_id(user_id: int):
     with db() as conn:
         row = conn.execute("SELECT help_msg_id FROM ege_bot.users WHERE user_id=%s", (user_id,)).fetchone()
@@ -691,19 +646,6 @@ def question_text(question, number: int, total: int):
         f"{chr(65 + i)}. {option}" for i, option in enumerate(question["options"])
     )
     return f"{head}\n\n{options_text}\n\n👇 Выбери букву ответа:"
-
-
-async def send_ad(chat_id: int, user_id: int):
-    ad = ADS[await asyncio.to_thread(next_ad_index, user_id)]
-    keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[[InlineKeyboardButton(text=ad["button"], url=ad["url"])]]
-    )
-    await bot.send_photo(
-        chat_id=chat_id,
-        photo=FSInputFile(ad["image"]),
-        caption=ad["caption"],
-        reply_markup=keyboard,
-    )
 
 
 async def send_question(chat_id: int, q, session_id: int, number: int, total: int):
@@ -923,11 +865,6 @@ async def answer(callback: CallbackQuery):
     chat_id = callback.message.chat.id
     if res["next_qid"] is not None:
         next_number = res["idx"] + 1
-        if next_number == AD_BEFORE_QUESTION:
-            try:
-                await send_ad(chat_id, user_id)
-            except TelegramAPIError:
-                pass  # сбой рекламы не должен ломать тренировку
         await send_question(chat_id, QMAP[res["next_qid"]], session_id, next_number, res["total"])
         return
 
@@ -1065,11 +1002,6 @@ async def ege_done(callback: CallbackQuery):
     chat_id = callback.message.chat.id
     if res["next_task"] is not None:
         next_number = res["idx"] + 1
-        if next_number == AD_BEFORE_QUESTION:
-            try:
-                await send_ad(chat_id, user_id)
-            except TelegramAPIError:
-                pass
         await bot.send_message(
             chat_id,
             ege_task_text(res["next_task"], next_number, res["total"]),
